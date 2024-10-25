@@ -1,2 +1,2 @@
 # Windows-kernel
-some  windows kernel pwn challenges in CTF
+some windows kernel rubbish
