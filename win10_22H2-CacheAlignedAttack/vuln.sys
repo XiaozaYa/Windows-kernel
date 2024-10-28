@@ -1,0 +1,156 @@
+#include <wdm.h>
+
+UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(L"\\Device\\MyDevice");
+UNICODE_STRING SymLinkName = RTL_CONSTANT_STRING(L"\\??\\MyDeviceSymLink");
+PDEVICE_OBJECT DeviceObject = NULL;
+
+NTSTATUS DriverUnload(PDRIVER_OBJECT Driver) {
+	DbgPrint("This driver is unloading...\n");
+	IoDeleteSymbolicLink(&SymLinkName);
+	IoDeleteDevice(DeviceObject);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS DispatchPassThru(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
+	NTSTATUS status = STATUS_SUCCESS;
+	if (IrpSp) {
+		switch (IrpSp->MajorFunction) {
+		case IRP_MJ_CREATE:
+			DbgPrint("create request\n");
+			break;
+		case IRP_MJ_READ:
+			DbgPrint("read request\n");
+			break;
+		case IRP_MJ_WRITE:
+			DbgPrint("write request\n");
+			break;
+		case IRP_MJ_CLOSE:
+			DbgPrint("close request\n");
+			break;
+		default:
+			status = STATUS_INVALID_PARAMETER;
+			DbgPrint("default: %wd\n", IrpSp->MajorFunction);
+			break;
+		}
+	}
+
+	Irp->IoStatus.Information = 0;
+	Irp->IoStatus.Status = status;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return status;
+}
+
+
+#define ADD		CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define DELE	CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define EDIT	CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define SHOW	CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define TAG 0x41424241
+
+typedef struct request {
+	DWORD64 size;
+	POOL_TYPE poolType;
+	void* buffer;
+}request;
+
+void* add(request* req) {
+	void* res = NULL;
+	res = ExAllocatePoolWithTag(req->poolType, req->size, TAG);
+	if (!res) {
+		goto EXIT;
+	}
+	RtlFillMemory(res, req->size, 'A');
+EXIT:
+	return res;
+}
+
+BOOLEAN edit(request* req, void* p) {
+	memcpy(p, req->buffer, req->size);
+	return TRUE;
+}
+
+NTSTATUS IrpIoctlHandler(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
+	NTSTATUS status = STATUS_SUCCESS;
+	
+	PVOID SystemBuffer = Irp->AssociatedIrp.SystemBuffer;
+	PVOID Type3InputBuffer = IrpSp->Parameters.DeviceIoControl.Type3InputBuffer;
+	PVOID UserBuffer = Irp->UserBuffer;
+	ULONG InputBufferLength = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+	ULONG OutputBufferLength = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+	ULONG retLength = 0;
+	DWORD64 *p = DeviceObject->DeviceExtension;
+	if (InputBufferLength != sizeof(request)) {
+		goto EXIT;
+	}
+	switch (IrpSp->Parameters.DeviceIoControl.IoControlCode) {
+	case ADD:
+		if (p[0]) {
+			ExFreePoolWithTag(p[0], TAG);
+			p[0] = NULL;
+		}
+
+		p[0] = add(SystemBuffer);
+		if (!p[0]) {
+			goto EXIT;
+		}
+
+		*(DWORD64*)SystemBuffer = p[0];
+		retLength = 8;
+		break;
+	case DELE:
+		if (p[0]) {
+			ExFreePoolWithTag(p[0], TAG);
+			p[0] = NULL;
+		}
+		break;
+	case EDIT:
+		edit(SystemBuffer, p[0]);
+		break;
+	case SHOW:
+		break;
+	default:
+EXIT:
+		status = STATUS_INVALID_PARAMETER;
+		break;
+	}
+	DbgPrint("IrpIoctlHandler Over!\n");
+	DbgPrint("=======================================================================\n\n");
+	Irp->IoStatus.Information = retLength;
+	Irp->IoStatus.Status = status;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return status;
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath) {
+
+	NTSTATUS status = STATUS_SUCCESS;
+	Driver->DriverUnload = DriverUnload;
+	DbgPrint("DriverEntry: %ws\n", RegPath->Buffer);
+	status = IoCreateDevice(Driver, 0x18, &DeviceName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &DeviceObject);
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("IoCreateDevice Failed\n");
+		return status;
+	}
+	
+	status = IoCreateSymbolicLink(&SymLinkName, &DeviceName);
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("IoCreateSymbolicLink Failed\n");
+		IoDeleteDevice(DeviceObject);
+		return status;
+	}
+	
+	for (int i = 0; i < IRP_MJ_MAXIMUM_FUNCTION; i++) {
+		Driver->MajorFunction[i] = DispatchPassThru;
+	}
+
+	Driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IrpIoctlHandler;
+	
+	DWORD64 *p = DeviceObject->DeviceExtension;
+	p[0] = p[1] = p[2] = 0;
+	
+	DbgPrint("Load Driver Successfully\n");
+	return status;
+}
